@@ -1,0 +1,58 @@
+# Cisco Configuration Backup via SNMPv3 + SCP
+# =============================================
+# Protect this file: chmod 600 config.yaml
+
+# SCP Server Configuration
+scp_server:
+  ip_address: 192.168.1.10          # SCP server IP (must be reachable from Cisco devices)
+  username: cisco_backup            # SSH/SCP username on server
+  password: SecureScpPass123!       # SSH/SCP password
+  port: 22                          # SSH port (default: 22)
+  remote_path: /var/backups/cisco   # Directory on server to store configs
+
+# Backup Settings
+backup:
+  backup_dir: /var/backups/cisco    # Local directory for downloaded configs
+  max_workers: 5                    # Parallel backup threads
+  retention_days: 30                # Days to keep old backups
+  log_file: /var/log/cisco_backup.log
+  log_level: INFO                   # DEBUG, INFO, WARNING, ERROR
+  poll_interval: 2                  # Seconds between status checks
+  max_poll_attempts: 60             # Max status checks (60 * 2s = 2 min timeout)
+
+# SNMPv3 Default Credentials
+# Security Levels: noAuthNoPriv, authNoPriv, authPriv (recommended)
+# Auth Protocols: MD5, SHA, SHA224, SHA256, SHA384, SHA512
+# Priv Protocols: DES, 3DES, AES, AES128, AES192, AES256
+snmpv3_defaults:
+  username: backupuser
+  auth_protocol: SHA256             # Recommended: SHA256 or higher
+  auth_password: AuthPass123!Secure
+  priv_protocol: AES256             # Recommended: AES256
+  priv_password: PrivPass123!Secure
+  security_level: authPriv          # Always use authPriv for production
+
+# Device Inventory
+devices:
+  # Headquarters - Core
+  - hostname: HQ-CORE-RTR01
+    ip_address: 10.0.0.1
+    
+  - hostname: HQ-CORE-RTR02
+    ip_address: 10.0.0.2
+    
+  - hostname: HQ-CORE-SW01
+    ip_address: 10.0.0.10
+
+  # Branch Office (different credentials)
+  - hostname: BR1-RTR01
+    ip_address: 10.1.0.1
+    snmpv3:
+      username: br1_backup
+      auth_password: Branch1Auth456!
+      priv_password: Branch1Priv456!
+
+  # Data Center (longer timeout)
+  - hostname: DC-CORE-RTR01
+    ip_address: 10.100.0.1
+    timeout: 60

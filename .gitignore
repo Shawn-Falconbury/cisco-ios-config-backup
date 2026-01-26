@@ -1,0 +1,26 @@
+# Ignore config files with credentials
+config.yaml
+*.cfg
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# Logs and backups
+*.log
+/backups/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
