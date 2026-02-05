@@ -23,6 +23,7 @@ import yaml
 import socket
 import hashlib
 import time
+import functools
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, List, Any
@@ -107,6 +108,7 @@ class SCPCredentials:
     password: str
     port: int = 22
     remote_path: str = '/backups'
+    known_hosts_file: str = ''  # FIX #1: Optional path to known_hosts file
 
 
 @dataclass
@@ -186,11 +188,264 @@ def get_snmpv3_auth(snmpv3: SNMPv3Credentials) -> UsmUserData:
     )
 
 
-async def snmp_get(device: DeviceConfig, oid: str) -> Optional[Any]:
-    """Perform SNMPv3 GET operation."""
+# =============================================================================
+# FIX #5: Resolve hostname or IP to validated IPv4 address
+# =============================================================================
+
+def resolve_server_ip(server_address: str) -> str:
+    """Resolve a hostname or validate an IP address to dotted-decimal IPv4.
+
+    The CISCO-CONFIG-COPY-MIB requires a raw 4-byte IPv4 address for
+    ccCopyServerAddressRev1. This function handles both dotted-decimal
+    IPs and hostnames (e.g., scp.backup.local) so the config file can
+    use either format without crashing.
+
+    Args:
+        server_address: IP address or hostname from the configuration.
+
+    Returns:
+        Dotted-decimal IPv4 string (e.g., '192.168.1.10').
+
+    Raises:
+        ValueError: If the address cannot be resolved to IPv4.
+    """
+    try:
+        # socket.gethostbyname handles both hostnames and IPs transparently —
+        # if it's already a valid IP, it returns it unchanged
+        resolved_ip = socket.gethostbyname(server_address)
+        # Validate the result is a well-formed IPv4 address
+        parts = resolved_ip.split('.')
+        if len(parts) != 4 or not all(0 <= int(p) <= 255 for p in parts):
+            raise ValueError(f"Resolved address is not valid IPv4: {resolved_ip}")
+        return resolved_ip
+    except socket.gaierror as e:
+        raise ValueError(
+            f"Cannot resolve SCP server address '{server_address}' to IPv4: {e}. "
+            f"Use a dotted-decimal IP or a resolvable hostname in the config."
+        )
+
+
+# =============================================================================
+# FIX #1: Secure SSH client creation with host key verification
+# =============================================================================
+
+def _create_ssh_client(scp_config: SCPCredentials, logger: logging.Logger) -> 'paramiko.SSHClient':
+    """Create a paramiko SSHClient with proper host key verification.
+
+    Loads system known_hosts (~/.ssh/known_hosts) and optionally a custom
+    known_hosts file specified in the config. Uses RejectPolicy so that
+    connections to unknown servers fail loudly instead of silently trusting
+    an attacker's key (MitM defense).
+
+    First-time setup requires a one-time manual SSH to the SCP server
+    to seed the fingerprint:
+        ssh cisco_backup@192.168.1.10   # accept the key, then disconnect
+
+    Args:
+        scp_config: SCP server credentials and connection settings.
+        logger: Logger instance for debug output.
+
+    Returns:
+        Configured paramiko.SSHClient ready for .connect().
+    """
+    import paramiko
+
+    client = paramiko.SSHClient()
+
+    # Load the system-wide known_hosts file (e.g., /etc/ssh/ssh_known_hosts)
+    client.load_system_host_keys()
+
+    # Load the user's known_hosts — this is where 'ssh user@host' saves keys
+    user_known_hosts = Path.home() / '.ssh' / 'known_hosts'
+    if user_known_hosts.exists():
+        client.load_host_keys(str(user_known_hosts))
+        logger.debug(f"Loaded host keys from {user_known_hosts}")
+
+    # Load an optional custom known_hosts file from the config
+    if scp_config.known_hosts_file:
+        custom_kh = Path(scp_config.known_hosts_file)
+        if custom_kh.exists():
+            client.load_host_keys(str(custom_kh))
+            logger.debug(f"Loaded custom host keys from {custom_kh}")
+        else:
+            logger.warning(f"Custom known_hosts file not found: {custom_kh}")
+
+    # Reject unknown host keys — this prevents MitM attacks
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
+
+    return client
+
+
+# =============================================================================
+# FIX #3: Synchronous paramiko operations for use with asyncio.to_thread()
+# =============================================================================
+
+def _verify_scp_server_sync(scp_config: SCPCredentials, logger: logging.Logger) -> bool:
+    """Synchronous SCP server verification (runs in thread executor).
+
+    Connects to the SCP server, verifies the remote backup directory
+    exists (creating it if necessary), then disconnects. This is a
+    blocking function intended to be called via asyncio.to_thread().
+
+    Args:
+        scp_config: SCP server credentials and connection settings.
+        logger: Logger instance.
+
+    Returns:
+        True if the server is reachable and the directory is ready.
+    """
+    try:
+        import paramiko
+    except ImportError:
+        logger.warning("paramiko not installed - skipping SCP server verification")
+        return True
+
+    client = None
+    sftp = None
+    try:
+        logger.info(f"Verifying SCP server connectivity to {scp_config.server_ip}...")
+        client = _create_ssh_client(scp_config, logger)
+        client.connect(
+            hostname=scp_config.server_ip, port=scp_config.port,
+            username=scp_config.username, password=scp_config.password,
+            timeout=10, allow_agent=False, look_for_keys=False,
+        )
+        sftp = client.open_sftp()
+        try:
+            sftp.stat(scp_config.remote_path)
+            logger.info(f"SCP server verified: {scp_config.remote_path} exists")
+        except FileNotFoundError:
+            logger.warning(f"Creating backup directory: {scp_config.remote_path}")
+            sftp.mkdir(scp_config.remote_path)
+        return True
+    except paramiko.ssh_exception.SSHException as e:
+        if "not found in known_hosts" in str(e) or "Server" in str(e):
+            logger.error(
+                f"SCP server host key verification failed: {e}\n"
+                f"  To fix this, SSH to the server once manually to trust the key:\n"
+                f"    ssh {scp_config.username}@{scp_config.server_ip} -p {scp_config.port}\n"
+                f"  Or add the key to your known_hosts file:\n"
+                f"    ssh-keyscan -p {scp_config.port} {scp_config.server_ip} >> ~/.ssh/known_hosts"
+            )
+        else:
+            logger.error(f"SCP server verification failed: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"SCP server verification failed: {e}")
+        return False
+    finally:
+        if sftp:
+            sftp.close()
+        if client:
+            client.close()
+
+
+def _download_backup_sync(
+    scp_config: SCPCredentials, remote_filename: str,
+    local_path: Path, logger: logging.Logger,
+) -> Optional[str]:
+    """Synchronous SCP file download (runs in thread executor).
+
+    Downloads a single backup file from the SCP server to local storage.
+    This is a blocking function intended to be called via asyncio.to_thread().
+
+    Args:
+        scp_config: SCP server credentials and connection settings.
+        remote_filename: Filename on the remote server.
+        local_path: Local directory to save the downloaded file.
+        logger: Logger instance.
+
+    Returns:
+        Path to the downloaded local file, or None on failure.
+    """
+    try:
+        import paramiko
+    except ImportError:
+        logger.warning("paramiko not installed - backup remains on SCP server only")
+        return None
+
+    remote_file = f"{scp_config.remote_path.rstrip('/')}/{remote_filename}"
+    local_file = local_path / remote_filename
+    client = None
+    sftp = None
+    try:
+        logger.info(f"Downloading backup from SCP server: {remote_file}")
+        client = _create_ssh_client(scp_config, logger)
+        client.connect(
+            hostname=scp_config.server_ip, port=scp_config.port,
+            username=scp_config.username, password=scp_config.password,
+            timeout=30, allow_agent=False, look_for_keys=False,
+        )
+        sftp = client.open_sftp()
+        sftp.get(remote_file, str(local_file))
+        logger.info(f"Backup downloaded to: {local_file}")
+        return str(local_file)
+    except paramiko.ssh_exception.SSHException as e:
+        if "not found in known_hosts" in str(e) or "Server" in str(e):
+            logger.error(
+                f"SCP download host key verification failed: {e}\n"
+                f"  Run: ssh-keyscan -p {scp_config.port} {scp_config.server_ip} >> ~/.ssh/known_hosts"
+            )
+        else:
+            logger.error(f"Failed to download backup: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to download backup: {e}")
+        return None
+    finally:
+        if sftp:
+            sftp.close()
+        if client:
+            client.close()
+
+
+# =============================================================================
+# FIX #3: Async wrappers that run blocking paramiko in thread executor
+# =============================================================================
+
+async def verify_scp_server(scp_config: SCPCredentials, logger: logging.Logger) -> bool:
+    """Verify SCP server is accessible (non-blocking async wrapper).
+
+    Delegates the blocking paramiko work to a thread via asyncio.to_thread()
+    so the event loop remains free to service SNMP polling and other
+    concurrent device operations.
+    """
+    return await asyncio.to_thread(_verify_scp_server_sync, scp_config, logger)
+
+
+async def download_backup_from_scp(
+    scp_config: SCPCredentials, remote_filename: str,
+    local_path: Path, logger: logging.Logger,
+) -> Optional[str]:
+    """Download backup from SCP server (non-blocking async wrapper).
+
+    Delegates the blocking paramiko work to a thread via asyncio.to_thread()
+    so the event loop remains free to service SNMP polling and other
+    concurrent device operations.
+    """
+    return await asyncio.to_thread(
+        _download_backup_sync, scp_config, remote_filename, local_path, logger,
+    )
+
+
+# =============================================================================
+# FIX #4: SNMP operations accept a shared SnmpEngine instance
+# =============================================================================
+
+async def snmp_get(device: DeviceConfig, oid: str, engine: SnmpEngine) -> Optional[Any]:
+    """Perform SNMPv3 GET operation.
+
+    Args:
+        device: Target device configuration.
+        oid: OID to query.
+        engine: Shared SnmpEngine instance — reusing a single engine
+                avoids per-request CPU overhead and maintains consistent
+                USM state (snmpEngineBoots/Time) required by RFC 3414
+                replay protection on hardened Cisco devices.
+    """
     try:
         iterator = getCmd(
-            SnmpEngine(), get_snmpv3_auth(device.snmpv3),
+            engine, get_snmpv3_auth(device.snmpv3),
             await UdpTransportTarget.create((device.ip_address, device.snmp_port), timeout=device.timeout, retries=device.retries),
             ContextData(), ObjectType(ObjectIdentity(oid))
         )
@@ -205,11 +460,18 @@ async def snmp_get(device: DeviceConfig, oid: str) -> Optional[Any]:
         raise Exception(f"SNMPv3 GET failed for {device.hostname}: {e}")
 
 
-async def snmp_set(device: DeviceConfig, oid: str, value) -> bool:
-    """Perform SNMPv3 SET operation."""
+async def snmp_set(device: DeviceConfig, oid: str, value, engine: SnmpEngine) -> bool:
+    """Perform SNMPv3 SET operation.
+
+    Args:
+        device: Target device configuration.
+        oid: OID to set.
+        value: Value to write (Integer, OctetString, etc.).
+        engine: Shared SnmpEngine instance.
+    """
     try:
         iterator = setCmd(
-            SnmpEngine(), get_snmpv3_auth(device.snmpv3),
+            engine, get_snmpv3_auth(device.snmpv3),
             await UdpTransportTarget.create((device.ip_address, device.snmp_port), timeout=device.timeout, retries=device.retries),
             ContextData(), ObjectType(ObjectIdentity(oid), value)
         )
@@ -223,67 +485,74 @@ async def snmp_set(device: DeviceConfig, oid: str, value) -> bool:
         raise Exception(f"SNMPv3 SET failed for {device.hostname}: {e}")
 
 
-async def backup_via_scp(device: DeviceConfig, scp_config: SCPCredentials, backup_filename: str, backup_config: BackupConfig, logger: logging.Logger) -> bool:
+async def backup_via_scp(
+    device: DeviceConfig, scp_config: SCPCredentials,
+    backup_filename: str, backup_config: BackupConfig,
+    logger: logging.Logger, engine: SnmpEngine,
+) -> bool:
     """Backup configuration using CISCO-CONFIG-COPY-MIB via SCP."""
     import random
     row_index = random.randint(100, 65535)
     remote_file = f"{scp_config.remote_path.rstrip('/')}/{backup_filename}"
-    
+
     try:
         logger.info(f"[{device.hostname}] Starting SCP backup to {scp_config.server_ip}:{remote_file}")
-        ip_parts = [int(x) for x in scp_config.server_ip.split('.')]
+
+        # FIX #5: Resolve hostname/IP to validated IPv4 for the MIB
+        resolved_ip = resolve_server_ip(scp_config.server_ip)
+        ip_parts = [int(x) for x in resolved_ip.split('.')]
         ip_bytes = bytes(ip_parts)
-        
+
         logger.debug(f"[{device.hostname}] Setting copy protocol to SCP (4)")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyProtocol']}.{row_index}", Integer(COPY_PROTOCOL['scp']))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyProtocol']}.{row_index}", Integer(COPY_PROTOCOL['scp']), engine)
+
         logger.debug(f"[{device.hostname}] Setting source to running-config")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopySourceFileType']}.{row_index}", Integer(FILE_TYPE['runningConfig']))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopySourceFileType']}.{row_index}", Integer(FILE_TYPE['runningConfig']), engine)
+
         logger.debug(f"[{device.hostname}] Setting destination to network file")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyDestFileType']}.{row_index}", Integer(FILE_TYPE['networkFile']))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyDestFileType']}.{row_index}", Integer(FILE_TYPE['networkFile']), engine)
+
         logger.debug(f"[{device.hostname}] Setting server address type to IPv4")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyServerAddressType']}.{row_index}", Integer(1))
-        
-        logger.debug(f"[{device.hostname}] Setting server address to {scp_config.server_ip}")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyServerAddressRev1']}.{row_index}", OctetString(hexValue=ip_bytes.hex()))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyServerAddressType']}.{row_index}", Integer(1), engine)
+
+        logger.debug(f"[{device.hostname}] Setting server address to {resolved_ip}")
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyServerAddressRev1']}.{row_index}", OctetString(hexValue=ip_bytes.hex()), engine)
+
         logger.debug(f"[{device.hostname}] Setting filename to {remote_file}")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyFileName']}.{row_index}", OctetString(remote_file))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyFileName']}.{row_index}", OctetString(remote_file), engine)
+
         logger.debug(f"[{device.hostname}] Setting SCP username")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyUserName']}.{row_index}", OctetString(scp_config.username))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyUserName']}.{row_index}", OctetString(scp_config.username), engine)
+
         logger.debug(f"[{device.hostname}] Setting SCP password")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyUserPassword']}.{row_index}", OctetString(scp_config.password))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyUserPassword']}.{row_index}", OctetString(scp_config.password), engine)
+
         logger.debug(f"[{device.hostname}] Activating copy operation")
-        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['createAndGo']))
-        
+        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['createAndGo']), engine)
+
         logger.info(f"[{device.hostname}] Waiting for SCP transfer to complete...")
-        
+
         for attempt in range(backup_config.max_poll_attempts):
             await asyncio.sleep(backup_config.poll_interval)
             try:
-                state_val = await snmp_get(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyState']}.{row_index}")
+                state_val = await snmp_get(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyState']}.{row_index}", engine)
                 state_int = int(state_val) if state_val else 0
                 state_str = COPY_STATE.get(state_int, 'unknown')
                 logger.debug(f"[{device.hostname}] Copy state: {state_str} (attempt {attempt + 1})")
-                
+
                 if state_int == 3:
                     logger.info(f"[{device.hostname}] SCP backup completed successfully")
                     try:
-                        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['destroy']))
+                        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['destroy']), engine)
                     except Exception as cleanup_err:
                         logger.debug(f"[{device.hostname}] Row cleanup note: {cleanup_err}")
                     return True
                 elif state_int == 4:
-                    fail_val = await snmp_get(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyFailCause']}.{row_index}")
+                    fail_val = await snmp_get(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyFailCause']}.{row_index}", engine)
                     fail_int = int(fail_val) if fail_val else 1
                     fail_str = FAIL_CAUSE.get(fail_int, f'unknown ({fail_int})')
                     try:
-                        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['destroy']))
+                        await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['destroy']), engine)
                     except:
                         pass
                     raise Exception(f"SCP copy failed: {fail_str}")
@@ -291,23 +560,23 @@ async def backup_via_scp(device: DeviceConfig, scp_config: SCPCredentials, backu
                 if "failed" in str(poll_err).lower():
                     raise
                 logger.debug(f"[{device.hostname}] Poll error (will retry): {poll_err}")
-        
+
         raise Exception(f"Copy operation timed out after {backup_config.max_poll_attempts * backup_config.poll_interval} seconds")
     except Exception as e:
         logger.error(f"[{device.hostname}] SCP backup failed: {e}")
         try:
-            await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['destroy']))
+            await snmp_set(device, f"{CISCO_CONFIG_COPY_MIB['ccCopyEntryRowStatus']}.{row_index}", Integer(ROW_STATUS['destroy']), engine)
         except:
             pass
         return False
 
 
-async def get_device_info(device: DeviceConfig, logger: logging.Logger) -> Dict[str, str]:
+async def get_device_info(device: DeviceConfig, logger: logging.Logger, engine: SnmpEngine) -> Dict[str, str]:
     """Get basic device information via SNMPv3."""
     info = {}
     for name, oid in DEVICE_INFO_OIDS.items():
         try:
-            value = await snmp_get(device, oid)
+            value = await snmp_get(device, oid, engine)
             info[name] = str(value) if value else None
             logger.debug(f"[{device.hostname}] {name}: {info[name]}")
         except Exception as e:
@@ -316,59 +585,10 @@ async def get_device_info(device: DeviceConfig, logger: logging.Logger) -> Dict[
     return info
 
 
-async def verify_scp_server(scp_config: SCPCredentials, logger: logging.Logger) -> bool:
-    """Verify SCP server is accessible using paramiko."""
-    try:
-        import paramiko
-        logger.info(f"Verifying SCP server connectivity to {scp_config.server_ip}...")
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=scp_config.server_ip, port=scp_config.port, username=scp_config.username,
-                      password=scp_config.password, timeout=10, allow_agent=False, look_for_keys=False)
-        sftp = client.open_sftp()
-        try:
-            sftp.stat(scp_config.remote_path)
-            logger.info(f"SCP server verified: {scp_config.remote_path} exists")
-        except FileNotFoundError:
-            logger.warning(f"Creating backup directory: {scp_config.remote_path}")
-            sftp.mkdir(scp_config.remote_path)
-        sftp.close()
-        client.close()
-        return True
-    except ImportError:
-        logger.warning("paramiko not installed - skipping SCP server verification")
-        return True
-    except Exception as e:
-        logger.error(f"SCP server verification failed: {e}")
-        return False
-
-
-async def download_backup_from_scp(scp_config: SCPCredentials, remote_filename: str, local_path: Path, logger: logging.Logger) -> Optional[str]:
-    """Download the backup file from SCP server to local storage."""
-    try:
-        import paramiko
-        remote_file = f"{scp_config.remote_path.rstrip('/')}/{remote_filename}"
-        local_file = local_path / remote_filename
-        logger.info(f"Downloading backup from SCP server: {remote_file}")
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname=scp_config.server_ip, port=scp_config.port, username=scp_config.username,
-                      password=scp_config.password, timeout=30, allow_agent=False, look_for_keys=False)
-        sftp = client.open_sftp()
-        sftp.get(remote_file, str(local_file))
-        sftp.close()
-        client.close()
-        logger.info(f"Backup downloaded to: {local_file}")
-        return str(local_file)
-    except ImportError:
-        logger.warning("paramiko not installed - backup remains on SCP server only")
-        return None
-    except Exception as e:
-        logger.error(f"Failed to download backup: {e}")
-        return None
-
-
-async def backup_device(device: DeviceConfig, backup_config: BackupConfig, logger: logging.Logger) -> Dict[str, Any]:
+async def backup_device(
+    device: DeviceConfig, backup_config: BackupConfig,
+    logger: logging.Logger, engine: SnmpEngine,
+) -> Dict[str, Any]:
     """Perform backup for a single device."""
     result = {
         'hostname': device.hostname, 'ip_address': device.ip_address, 'success': False,
@@ -377,19 +597,19 @@ async def backup_device(device: DeviceConfig, backup_config: BackupConfig, logge
     }
     try:
         logger.info(f"[{device.hostname}] Connecting via SNMPv3...")
-        result['device_info'] = await get_device_info(device, logger)
+        result['device_info'] = await get_device_info(device, logger, engine)
         if not result['device_info'].get('sysName'):
             raise Exception("Failed to retrieve device information - check SNMPv3 credentials")
         logger.info(f"[{device.hostname}] Connected - {result['device_info'].get('sysDescr', 'Unknown')[:60]}...")
-        
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_hostname = device.hostname.replace(' ', '_').replace('/', '-').replace('\\', '-')
         backup_filename = f"{safe_hostname}_{timestamp}.cfg"
         backup_dir = Path(backup_config.backup_dir) / safe_hostname
         backup_dir.mkdir(parents=True, exist_ok=True)
-        
+
         if backup_config.scp:
-            success = await backup_via_scp(device, backup_config.scp, backup_filename, backup_config, logger)
+            success = await backup_via_scp(device, backup_config.scp, backup_filename, backup_config, logger, engine)
             if success:
                 result['backup_file'] = f"scp://{backup_config.scp.server_ip}{backup_config.scp.remote_path}/{backup_filename}"
                 result['success'] = True
@@ -435,7 +655,7 @@ def load_config(config_file: str) -> tuple[BackupConfig, List[DeviceConfig]]:
     """Load configuration from YAML file."""
     with open(config_file, 'r') as f:
         config = yaml.safe_load(f)
-    
+
     scp_settings = config.get('scp_server', {})
     scp_config = None
     if scp_settings:
@@ -443,8 +663,9 @@ def load_config(config_file: str) -> tuple[BackupConfig, List[DeviceConfig]]:
             server_ip=scp_settings['ip_address'], username=scp_settings['username'],
             password=scp_settings['password'], port=scp_settings.get('port', 22),
             remote_path=scp_settings.get('remote_path', '/backups'),
+            known_hosts_file=scp_settings.get('known_hosts_file', ''),  # FIX #1
         )
-    
+
     backup_settings = config.get('backup', {})
     backup_config = BackupConfig(
         backup_dir=backup_settings.get('backup_dir', '/var/backups/cisco'), scp=scp_config,
@@ -453,7 +674,7 @@ def load_config(config_file: str) -> tuple[BackupConfig, List[DeviceConfig]]:
         log_level=backup_settings.get('log_level', 'INFO'), poll_interval=backup_settings.get('poll_interval', 2),
         max_poll_attempts=backup_settings.get('max_poll_attempts', 60),
     )
-    
+
     snmpv3_defaults = config.get('snmpv3_defaults', {})
     default_snmpv3 = SNMPv3Credentials(
         username=snmpv3_defaults.get('username', 'backupuser'),
@@ -463,7 +684,7 @@ def load_config(config_file: str) -> tuple[BackupConfig, List[DeviceConfig]]:
         priv_password=snmpv3_defaults.get('priv_password', ''),
         security_level=snmpv3_defaults.get('security_level', 'authPriv'),
     )
-    
+
     devices = []
     for device_cfg in config.get('devices', []):
         snmpv3_cfg = device_cfg.get('snmpv3', {})
@@ -485,7 +706,7 @@ def load_config(config_file: str) -> tuple[BackupConfig, List[DeviceConfig]]:
 
 
 def generate_sample_config(output_file: str):
-    """Generate a sample configuration file."""
+    """Generate a sample configuration file with secure permissions."""
     sample_config = """# Cisco Configuration Backup via SNMPv3 + SCP
 # Protect this file: chmod 600 config.yaml
 
@@ -495,6 +716,9 @@ scp_server:
   password: SecureScpPass123!
   port: 22
   remote_path: /var/backups/cisco
+  # Optional: path to a custom known_hosts file for SSH host key verification.
+  # If omitted, the system and user known_hosts (~/.ssh/known_hosts) are used.
+  # known_hosts_file: /etc/cisco_backup/known_hosts
 
 backup:
   backup_dir: /var/backups/cisco
@@ -521,27 +745,45 @@ devices:
 """
     with open(output_file, 'w') as f:
         f.write(sample_config)
-    print(f"Sample configuration written to: {output_file}")
-    print(f"\nIMPORTANT: Protect this file with: chmod 600 {output_file}")
+
+    # FIX #2: Immediately restrict file permissions — the config contains
+    # plaintext passwords (SNMPv3 auth/priv, SCP password) and must not
+    # be world-readable. 0o600 = read/write for owner only.
+    try:
+        os.chmod(output_file, 0o600)
+        print(f"Sample configuration written to: {output_file} (permissions set to 600)")
+    except OSError as e:
+        # chmod may fail on Windows or certain filesystems — warn but don't crash
+        print(f"Sample configuration written to: {output_file}")
+        print(f"WARNING: Could not set file permissions: {e}")
+        print(f"  Please manually run: chmod 600 {output_file}")
 
 
 async def run_backups(backup_config: BackupConfig, devices: List[DeviceConfig], logger: logging.Logger) -> List[Dict[str, Any]]:
     """Run backups for all devices with concurrency control."""
+
+    # FIX #4: Create a single SnmpEngine for the entire backup session.
+    # This avoids re-initializing USM state (snmpEngineBoots/Time) on every
+    # request, which reduces CPU overhead and prevents replay protection
+    # failures on Cisco devices that enforce RFC 3414 timeliness checks.
+    engine = SnmpEngine()
+    logger.debug("Initialized shared SnmpEngine for backup session")
+
     if backup_config.scp:
         scp_ok = await verify_scp_server(backup_config.scp, logger)
         if not scp_ok:
             logger.error("SCP server verification failed - aborting backups")
             return [{'hostname': 'SYSTEM', 'success': False, 'error': 'SCP server verification failed', 'timestamp': datetime.now().isoformat()}]
-    
+
     semaphore = asyncio.Semaphore(backup_config.max_workers)
-    
+
     async def bounded_backup(device):
         async with semaphore:
-            return await backup_device(device, backup_config, logger)
-    
+            return await backup_device(device, backup_config, logger, engine)
+
     tasks = [bounded_backup(device) for device in devices]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     processed_results = []
     for i, result in enumerate(results):
         if isinstance(result, Exception):
@@ -562,15 +804,15 @@ def main():
     parser.add_argument('--cleanup-only', action='store_true', help='Only run backup cleanup')
     parser.add_argument('--verify-only', action='store_true', help='Verify connectivity without backing up')
     args = parser.parse_args()
-    
+
     if args.generate_config:
         generate_sample_config(args.generate_config)
         return 0
-    
+
     if not args.config:
         parser.print_help()
         return 1
-    
+
     try:
         backup_config, devices = load_config(args.config)
     except FileNotFoundError:
@@ -579,22 +821,24 @@ def main():
     except Exception as e:
         print(f"Error loading configuration: {e}")
         return 1
-    
+
     if args.verbose:
         backup_config.log_level = 'DEBUG'
-    
+
     logger = setup_logging(backup_config.log_file, backup_config.log_level)
     logger.info("=" * 70)
     logger.info("Cisco Configuration Backup (SNMPv3 + SCP) Started")
     logger.info(f"Devices to backup: {len(devices)}")
     if backup_config.scp:
         logger.info(f"SCP Server: {backup_config.scp.server_ip}:{backup_config.scp.remote_path}")
-    
+
     if args.cleanup_only:
         cleanup_old_backups(backup_config.backup_dir, backup_config.retention_days, logger)
         return 0
-    
+
     if args.verify_only:
+        # FIX #4: Shared engine for verify-only mode too
+        engine = SnmpEngine()
         async def verify_all():
             if backup_config.scp:
                 scp_ok = await verify_scp_server(backup_config.scp, logger)
@@ -602,7 +846,7 @@ def main():
                     return False
             for device in devices:
                 try:
-                    info = await get_device_info(device, logger)
+                    info = await get_device_info(device, logger, engine)
                     if info.get('sysName'):
                         logger.info(f"[{device.hostname}] OK - {info.get('sysDescr', 'Unknown')[:50]}")
                     else:
@@ -612,11 +856,11 @@ def main():
             return True
         asyncio.run(verify_all())
         return 0
-    
+
     if not backup_config.scp:
         logger.error("No SCP server configured in config file")
         return 1
-    
+
     start_time = datetime.now()
     try:
         results = asyncio.run(run_backups(backup_config, devices, logger))
@@ -626,21 +870,21 @@ def main():
     except Exception as e:
         logger.error(f"Backup failed with exception: {e}")
         return 1
-    
+
     elapsed = datetime.now() - start_time
     successful = sum(1 for r in results if r.get('success'))
     failed = len(results) - successful
-    
+
     logger.info("=" * 70)
     logger.info(f"Backup Complete - Elapsed: {elapsed}")
     logger.info(f"Successful: {successful}, Failed: {failed}")
-    
+
     for result in results:
         if not result.get('success'):
             logger.error(f"FAILED: {result.get('hostname', 'Unknown')} - {result.get('error', 'Unknown error')}")
-    
+
     cleanup_old_backups(backup_config.backup_dir, backup_config.retention_days, logger)
-    
+
     report_file = Path(backup_config.backup_dir) / 'last_backup_report.yaml'
     report_file.parent.mkdir(parents=True, exist_ok=True)
     with open(report_file, 'w') as f:
